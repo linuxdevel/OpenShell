@@ -7,7 +7,7 @@ experimental_monorepo_root = true
 experimental = true
 
 [monorepo]
-config_roots = ["docker"]
+config_roots = ["docker", "kube"]
 
 [tools]
 python = "3.12"
@@ -16,6 +16,8 @@ kubectl = "latest"
 uv = "latest"
 protoc = "29"
 skaffold = "latest"
+k3d = "latest"
+helm = "latest"
 
 [env]
 KUBECONFIG = "{{config_root}}/kubeconfig"
@@ -117,6 +119,14 @@ run = "cargo run -p navigator-cli --"
 description = "Run the sandbox container with an interactive shell"
 depends = ["docker:build:factory"]
 run = "docker run -it navigator-factory -i /bin/bash"
+
+# ============================================================================
+# Helm Tasks
+# ============================================================================
+
+[tasks."helm:lint"]
+description = "Lint the navigator helm chart"
+run = "helm lint helm/navigator"
 
 # ============================================================================
 # Development Tasks

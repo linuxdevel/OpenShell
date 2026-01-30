@@ -175,3 +175,5 @@ temp/
 *.crt
 secrets/
 credentials/
+
+kubeconfig

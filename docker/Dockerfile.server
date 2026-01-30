@@ -1,0 +1,48 @@
+# Navigator Server Docker image
+# Multi-stage build for smaller final image
+
+# Stage 1: Rust builder
+FROM rust:1.85-slim AS builder
+
+# Install build dependencies for protobuf-src
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    cmake \
+    g++ \
+    make \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+COPY proto/ proto/
+RUN cargo build --release --package navigator-server
+
+# Stage 2: Runtime
+FROM debian:bookworm-slim AS runtime
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user
+RUN useradd --create-home --user-group navigator
+
+WORKDIR /app
+
+# Copy binary from builder
+COPY --from=builder /build/target/release/navigator-server /usr/local/bin/
+
+# Switch to non-root user
+USER navigator
+
+# Expose gRPC/HTTP port
+EXPOSE 50051
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:50051/healthz || exit 1
+
+# Run server binding to all interfaces
+ENTRYPOINT ["navigator-server"]
+CMD ["--bind", "0.0.0.0:50051"]

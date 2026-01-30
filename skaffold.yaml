@@ -1,0 +1,21 @@
+apiVersion: skaffold/v4beta11
+kind: Config
+metadata:
+  name: navigator
+build:
+  artifacts:
+    - image: navigator-registry:5000/navigator-server
+      docker:
+        dockerfile: docker/Dockerfile.server
+  local:
+    push: true
+deploy:
+  helm:
+    releases:
+      - name: navigator
+        chartPath: helm/navigator
+        namespace: navigator
+        createNamespace: true
+manifests:
+  rawYaml:
+    - https://github.com/kubernetes-sigs/agent-sandbox/releases/download/v0.1.0/manifest.yaml
