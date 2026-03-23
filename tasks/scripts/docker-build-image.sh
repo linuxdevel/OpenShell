@@ -21,6 +21,7 @@
 #                                     - targets like supervisor-output this bypasses forced tagging
 #                                     - and --load/--push so artifacts can be exported directly
 #   IMAGE_REGISTRY                    - Registry prefix for image name (e.g. ghcr.io/org/repo)
+#   IMAGE_NAME_OVERRIDE               - Full image repository/name override (e.g. ghcr.io/org/openshell-gateway)
 #   OPENSHELL_RUNTIME_BUNDLE_TARBALL  - required for cluster target
 #   OPENSHELL_RUNTIME_BUNDLE_VERIFY_ONLY
 #                                     - when set to "1" for cluster, validate and stage the bundle, then exit
@@ -456,7 +457,9 @@ case "$TARGET" in
     ;;
 esac
 
-if [[ -n "${IMAGE_REGISTRY:-}" ]]; then
+if [[ -n "${IMAGE_NAME_OVERRIDE:-}" ]]; then
+  IMAGE_NAME="${IMAGE_NAME_OVERRIDE}"
+elif [[ -n "${IMAGE_REGISTRY:-}" ]]; then
   IMAGE_NAME="${IMAGE_REGISTRY}/${IMAGE_NAME#openshell/}"
 fi
 
