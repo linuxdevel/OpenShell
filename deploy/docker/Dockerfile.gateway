@@ -93,9 +93,11 @@ WORKDIR /app
 
 COPY --from=builder /build/openshell-server /usr/local/bin/
 
-# Copy migrations to the build-time manifest directory expected by sqlx
+# Copy migrations to the build-time manifest directory expected by sqlx.
+# Set stable world-readable permissions so restrictive host umasks do not make
+# migrations unreadable to the runtime `openshell` user.
 RUN mkdir -p /build/crates/openshell-server
-COPY crates/openshell-server/migrations /build/crates/openshell-server/migrations
+COPY --chmod=755 crates/openshell-server/migrations /build/crates/openshell-server/migrations
 
 USER openshell
 EXPOSE 8080
