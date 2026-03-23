@@ -69,7 +69,7 @@ run_cluster_build() {
     PATH="$FAKE_BIN_DIR:$PATH" \
     OPENSHELL_CARGO_VERSION=0.0.0-test \
     "$@" \
-    bash tasks/scripts/docker-build-cluster.sh
+    bash tasks/scripts/docker-build-image.sh cluster
 }
 
 assert_no_docker_buildx_build() {
@@ -563,7 +563,7 @@ PY
 
   [ "$status" -eq 0 ]
   [[ "$output" == *"Packaging helm chart..."* ]]
-  [[ "$output" == *"Building cluster image..."* ]]
+  [[ "$output" == *"Building cluster image target..."* ]]
   [ -s "$FAKE_HELM_LOG" ]
   [ -s "$FAKE_DOCKER_LOG" ]
   [[ "$(<"$FAKE_DOCKER_LOG")" == *"buildx build"* ]]
@@ -881,12 +881,12 @@ PY
   assert_no_docker_buildx_build
 }
 
-@test "Dockerfile.cluster consumes the staged local runtime bundle instead of the apt-installed nvidia-toolkit stage" {
+@test "Dockerfile.images cluster target consumes the staged local runtime bundle instead of the apt-installed nvidia-toolkit stage" {
   run python3 - <<'PY'
 from pathlib import Path
 import sys
 
-dockerfile = Path("deploy/docker/Dockerfile.cluster").read_text(encoding="utf-8")
+dockerfile = Path("deploy/docker/Dockerfile.images").read_text(encoding="utf-8")
 
 checks = {
     "removes apt toolkit stage": "FROM ubuntu:24.04 AS nvidia-toolkit" not in dockerfile,

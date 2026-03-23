@@ -155,7 +155,7 @@ matches_gateway() {
     crates/openshell-router/*)
       return 0
       ;;
-    crates/openshell-server/*|deploy/docker/Dockerfile.gateway)
+    crates/openshell-server/*|deploy/docker/Dockerfile.images)
       return 0
       ;;
     *)
@@ -206,7 +206,7 @@ compute_fingerprint() {
   local committed_trees=""
   case "${component}" in
     gateway)
-      committed_trees=$(git ls-tree HEAD Cargo.toml Cargo.lock proto/ deploy/docker/cross-build.sh crates/openshell-core/ crates/openshell-providers/ crates/openshell-router/ crates/openshell-server/ deploy/docker/Dockerfile.gateway 2>/dev/null || true)
+      committed_trees=$(git ls-tree HEAD Cargo.toml Cargo.lock proto/ deploy/docker/cross-build.sh crates/openshell-core/ crates/openshell-providers/ crates/openshell-router/ crates/openshell-server/ deploy/docker/Dockerfile.images 2>/dev/null || true)
       ;;
     supervisor)
       committed_trees=$(git ls-tree HEAD Cargo.toml Cargo.lock proto/ deploy/docker/cross-build.sh crates/openshell-core/ crates/openshell-policy/ crates/openshell-router/ crates/openshell-sandbox/ 2>/dev/null || true)
@@ -299,7 +299,7 @@ build_start=$(date +%s)
 declare -a built_components=()
 
 if [[ "${build_gateway}" == "1" ]]; then
-  tasks/scripts/docker-build-component.sh gateway
+  tasks/scripts/docker-build-image.sh gateway
 fi
 
 # Build the supervisor binary and docker cp it into the running k3s cluster.
@@ -332,19 +332,14 @@ if [[ "${build_supervisor}" == "1" ]]; then
     fi
   fi
 
-  docker buildx build \
-    --file deploy/docker/Dockerfile.cluster \
-    --target supervisor-builder \
-    --build-arg "BUILDARCH=$(docker version --format '{{.Server.Arch}}')" \
-    --build-arg "TARGETARCH=${CLUSTER_ARCH}" \
-    ${SUPERVISOR_VERSION_ARGS[@]+"${SUPERVISOR_VERSION_ARGS[@]}"} \
-    --output "type=local,dest=${SUPERVISOR_BUILD_DIR}" \
-    --platform "linux/${CLUSTER_ARCH}" \
-    .
+  DOCKER_PLATFORM="linux/${CLUSTER_ARCH}" \
+  DOCKER_OUTPUT="type=local,dest=${SUPERVISOR_BUILD_DIR}" \
+  OPENSHELL_CARGO_VERSION="${OPENSHELL_CARGO_VERSION:-${_cargo_version:-}}" \
+    tasks/scripts/docker-build-image.sh supervisor-output
 
   # Copy the built binary into the running k3s container
   docker exec "${CONTAINER_NAME}" mkdir -p /opt/openshell/bin
-  docker cp "${SUPERVISOR_BUILD_DIR}/build/out/openshell-sandbox" \
+  docker cp "${SUPERVISOR_BUILD_DIR}/openshell-sandbox" \
     "${CONTAINER_NAME}:/opt/openshell/bin/openshell-sandbox"
   docker exec "${CONTAINER_NAME}" chmod 755 /opt/openshell/bin/openshell-sandbox
 

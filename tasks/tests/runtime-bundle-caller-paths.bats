@@ -103,9 +103,9 @@ make_bootstrap_harness() {
     "$harness_root/deploy/helm/openshell" \
     "$harness_root/deploy/docker"
   cp "tasks/scripts/cluster-bootstrap.sh" "$harness_root/tasks/scripts/cluster-bootstrap.sh"
-  cp "tasks/scripts/docker-build-cluster.sh" "$harness_root/tasks/scripts/docker-build-cluster.sh"
+  cp "tasks/scripts/docker-build-image.sh" "$harness_root/tasks/scripts/docker-build-image.sh"
 
-  printf 'FROM --platform=$BUILDPLATFORM rust:1.86\n' > "$harness_root/deploy/docker/Dockerfile.cluster"
+  printf 'FROM --platform=$BUILDPLATFORM rust:1.86 AS cluster\n' > "$harness_root/deploy/docker/Dockerfile.images"
 
   cat > "$harness_root/tasks/scripts/cluster-push-component.sh" <<'EOF'
 #!/usr/bin/env bash
@@ -133,16 +133,17 @@ make_multiarch_harness() {
 
   cp "tasks/scripts/docker-publish-multiarch.sh" "$harness_root/tasks/scripts/docker-publish-multiarch.sh"
 
-  cat > "$harness_root/tasks/scripts/docker-build-cluster.sh" <<'EOF'
+  cat > "$harness_root/tasks/scripts/docker-build-image.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-printf '%s|%s|%s\n' "${DOCKER_PLATFORM:-}" "${OPENSHELL_RUNTIME_BUNDLE_TARBALL:-}" "${IMAGE_TAG:-}" >> "$FAKE_CLUSTER_BUILD_LOG"
+if [[ "${1:-}" == "cluster" ]]; then
+  printf '%s|%s|%s\n' "${DOCKER_PLATFORM:-}" "${OPENSHELL_RUNTIME_BUNDLE_TARBALL:-}" "${IMAGE_TAG:-}" >> "$FAKE_CLUSTER_BUILD_LOG"
+fi
 EOF
-  chmod +x "$harness_root/tasks/scripts/docker-build-cluster.sh"
+  chmod +x "$harness_root/tasks/scripts/docker-build-image.sh"
 
   printf '[[package]]\nname = "openshell"\nversion = "0.0.0"\n' > "$harness_root/Cargo.lock"
-  printf 'FROM --platform=$BUILDPLATFORM rust:1.86\n' > "$harness_root/deploy/docker/Dockerfile.gateway"
-  printf 'FROM --platform=$BUILDPLATFORM rust:1.86\n' > "$harness_root/deploy/docker/Dockerfile.cluster"
+  printf 'FROM --platform=$BUILDPLATFORM rust:1.86 AS gateway\nFROM --platform=$BUILDPLATFORM rust:1.86 AS cluster\n' > "$harness_root/deploy/docker/Dockerfile.images"
 
   printf '%s\n' "$harness_root"
 }

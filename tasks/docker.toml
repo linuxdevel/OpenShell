@@ -12,7 +12,7 @@ depends = [
 
 ["docker:build:ci"]
 description = "Build the CI Docker image"
-run = "tasks/scripts/docker-build-component.sh ci"
+run = "docker build -f deploy/docker/Dockerfile.ci -t openshell/ci:${IMAGE_TAG:-dev} ."
 hide = true
 
 ["build:docker:gateway"]

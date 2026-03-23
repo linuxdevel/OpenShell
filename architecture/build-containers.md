@@ -74,7 +74,7 @@ The incremental deploy (`cluster-deploy-fast.sh`) fingerprints local Git changes
 | Changed files | Rebuild triggered |
 |---|---|
 | Cargo manifests, proto definitions, cross-build script | Gateway + supervisor |
-| `crates/openshell-server/*`, `deploy/docker/Dockerfile.gateway` | Gateway |
+| `crates/openshell-server/*`, `deploy/docker/Dockerfile.images` | Gateway |
 | `crates/openshell-sandbox/*`, `crates/openshell-policy/*` | Supervisor |
 | `deploy/helm/openshell/*` | Helm upgrade |
 
