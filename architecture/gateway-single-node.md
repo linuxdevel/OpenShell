@@ -29,7 +29,7 @@ Out of scope:
 - `crates/openshell-bootstrap/src/push.rs`: Local development image push into k3s containerd.
 - `crates/openshell-bootstrap/src/paths.rs`: XDG path resolution.
 - `crates/openshell-bootstrap/src/constants.rs`: Shared constants (image name, container/volume/network naming).
-- `deploy/docker/Dockerfile.cluster`: Container image definition (k3s base + Helm charts + manifests + entrypoint).
+- `deploy/docker/Dockerfile.images` target `cluster`: Container image definition (k3s base + Helm charts + manifests + entrypoint).
 - `deploy/docker/cluster-entrypoint.sh`: Container entrypoint (DNS proxy, registry config, manifest injection).
 - `deploy/docker/cluster-healthcheck.sh`: Docker HEALTHCHECK script.
 - Docker daemon(s):
@@ -72,7 +72,7 @@ Development task entrypoints split bootstrap behavior:
 |---|---|
 | `mise run cluster` | Bootstrap or incremental deploy: creates gateway if needed (fast recreate), then detects changed files and rebuilds/pushes only impacted components |
 
-For `mise run cluster`, `.env` acts as local source-of-truth for `GATEWAY_NAME`, `GATEWAY_PORT`, and `OPENSHELL_GATEWAY`. Missing keys are appended; existing values are preserved. If `GATEWAY_PORT` is missing, the task selects a free local port and persists it.
+For `mise run cluster`, `.env` acts as local source-of-truth for `GATEWAY_PORT` and `OPENSHELL_GATEWAY`. Missing keys are appended; existing values are preserved. If `GATEWAY_PORT` is missing, the task selects a free local port and persists it.
 Fast mode ensures a local registry (`127.0.0.1:5000`) is running and configures k3s to mirror pulls via `host.docker.internal:5000`, so the cluster task can push/pull local component images consistently.
 When that flow needs to rebuild the cluster image, it also requires `OPENSHELL_RUNTIME_BUNDLE_TARBALL`; prebuilt-image paths can still skip the local cluster-image build with `SKIP_CLUSTER_IMAGE_BUILD=1`.
 
@@ -102,7 +102,7 @@ sequenceDiagram
   B->>R: start_container
   B->>R: clean_stale_nodes (kubectl delete node)
   B->>R: wait_for_gateway_ready (180 attempts, 2s apart)
-  B->>R: poll for secret openshell-cli-client (90 attempts, 2s apart)
+  B->>R: extract client PKI from reconciled cluster secrets
   R-->>B: ca.crt, tls.crt, tls.key
   B->>B: atomically store mTLS bundle
   B->>B: create and persist gateway metadata JSON
@@ -201,7 +201,7 @@ The gateway StatefulSet also uses a Kubernetes `startupProbe` on the gRPC port b
 
 ### 5) mTLS bundle capture
 
-TLS is always required. `fetch_and_store_cli_mtls()` polls for Kubernetes secret `openshell-cli-client` in namespace `openshell` (90 attempts, 2 seconds apart, 3 min total). Each attempt checks the container is still running. The secret's base64-encoded `ca.crt`, `tls.crt`, and `tls.key` fields are decoded and stored.
+TLS is enabled unless deploy options explicitly disable it. After the bootstrap applies or reuses the server/client TLS secrets, the CLI extracts the client bundle from cluster-managed PKI and stores it locally for later authenticated commands. The current flow does not depend on polling a separate `openshell-cli-client` secret; it reads the reconciled client credentials from the cluster state that bootstrap just verified or created.
 
 Storage location: `~/.config/openshell/gateways/{name}/mtls/`
 
@@ -233,7 +233,7 @@ After deploy, the CLI calls `save_active_gateway(name)`, writing the gateway nam
 
 ## Container Image
 
-The gateway image is defined in `deploy/docker/Dockerfile.cluster`:
+The gateway bootstrap container image is defined by `deploy/docker/Dockerfile.images` target `cluster`:
 
 ```
 Base:  rancher/k3s:v1.35.2-k3s1
@@ -243,7 +243,7 @@ Layers added:
 
 1. Custom entrypoint: `deploy/docker/cluster-entrypoint.sh` -> `/usr/local/bin/cluster-entrypoint.sh`
 2. Healthcheck script: `deploy/docker/cluster-healthcheck.sh` -> `/usr/local/bin/cluster-healthcheck.sh`
-3. Packaged Helm charts: `deploy/docker/.build/charts/*.tgz` -> `/var/lib/rancher/k3s/server/static/charts/`
+3. Packaged Helm charts: `deploy/docker/.build/charts/*.tgz` -> `/opt/openshell/charts/` at image build time, then copied into `/var/lib/rancher/k3s/server/static/charts/` by the entrypoint at container start
 4. Kubernetes manifests: `deploy/kube/manifests/*.yaml` -> `/opt/openshell/manifests/`
 
 Bundled manifests include:
@@ -281,9 +281,9 @@ Copies bundled manifests from `/opt/openshell/manifests/` to `/var/lib/rancher/k
 
 When environment variables are set, the entrypoint modifies the HelmChart manifest at `/var/lib/rancher/k3s/server/manifests/openshell-helmchart.yaml`:
 
-- `IMAGE_REPO_BASE`: Rewrites `repository:`, `sandboxImage:`, and `jobImage:` in the HelmChart.
-- `PUSH_IMAGE_REFS`: In push mode, parses comma-separated image refs and rewrites the exact gateway, sandbox, and pki-job image references (matching on path component `/gateway:`, `/sandbox:`, `/pki-job:`).
-- `IMAGE_TAG`: Replaces `:latest` tags with the specified tag on gateway, sandbox, and pki-job images. Handles both quoted and unquoted `tag: latest` formats.
+- `IMAGE_REPO_BASE`: Rewrites the gateway image repository in the HelmChart.
+- `PUSH_IMAGE_REFS`: In push mode, parses comma-separated image refs and rewrites the exact gateway image reference used by the StatefulSet.
+- `IMAGE_TAG`: Replaces the gateway image `:latest` tag with the specified tag. Handles both quoted and unquoted `tag: latest` formats.
 - `IMAGE_PULL_POLICY`: Replaces `pullPolicy: Always` with the specified policy (e.g., `IfNotPresent`).
 - `SSH_GATEWAY_HOST` / `SSH_GATEWAY_PORT`: Replaces `__SSH_GATEWAY_HOST__` and `__SSH_GATEWAY_PORT__` placeholders.
 - `EXTRA_SANS`: Builds a YAML flow-style list from the comma-separated SANs and replaces `extraSANs: []`.
@@ -292,10 +292,12 @@ When environment variables are set, the entrypoint modifies the HelmChart manife
 
 `deploy/docker/cluster-healthcheck.sh` validates cluster readiness through a series of checks:
 
-1. **Kubernetes API**: `kubectl get --raw='/readyz'`
-2. **OpenShell StatefulSet**: Checks that `statefulset/openshell` in namespace `openshell` exists and has 1 ready replica.
-3. **Gateway**: Checks that `gateway/openshell-gateway` in namespace `openshell` has the `Programmed` condition.
-4. **mTLS secret** (conditional): If `NAV_GATEWAY_TLS_ENABLED` is true (or inferred from the HelmChart manifest using the same two-path detection logic as the bootstrap code), checks that secret `openshell-cli-client` exists with non-empty `ca.crt`, `tls.crt`, and `tls.key` data.
+1. **DNS preflight**: verifies the configured registry host is resolvable unless it is already an IP literal.
+2. **Kubernetes API**: `kubectl get --raw='/readyz'`
+3. **Node pressure markers**: emits `HEALTHCHECK_NODE_PRESSURE` warnings if the kubelet reports `DiskPressure`, `MemoryPressure`, or `PIDPressure`.
+4. **OpenShell StatefulSet**: checks that `statefulset/openshell` in namespace `openshell` exists and has 1 ready replica.
+5. **Sandbox supervisor binary**: checks that `/opt/openshell/bin/openshell-sandbox` exists and is executable, otherwise emits `HEALTHCHECK_MISSING_SUPERVISOR`.
+6. **TLS secrets** (when TLS is enabled): checks that `openshell-server-tls` and `openshell-client-tls` exist in namespace `openshell`.
 
 ## GPU Enablement
 
@@ -303,10 +305,10 @@ GPU support is part of the single-node gateway bootstrap path rather than a sepa
 
 - `openshell gateway start --gpu` threads a boolean deploy option through `crates/openshell-cli`, `crates/openshell-bootstrap`, and `crates/openshell-bootstrap/src/docker.rs`.
 - When enabled, the cluster container is created with Docker `DeviceRequests`, which is the API equivalent of `docker run --gpus all`.
-- `tasks/scripts/docker-build-cluster.sh` now validates a staged local runtime-bundle tarball and places the verified payload under `deploy/docker/.build/runtime-bundle/<arch>/` before Docker runs.
-- `deploy/docker/Dockerfile.cluster` copies the runtime binaries, config, and `libnvidia-container` shared libraries from that staged local bundle into the final Ubuntu-based cluster image instead of installing toolkit packages from an apt repository during the build.
+- `tasks/scripts/docker-build-image.sh cluster` now validates a staged local runtime-bundle tarball and places the verified payload under `deploy/docker/.build/runtime-bundle/<arch>/` before Docker runs.
+- `deploy/docker/Dockerfile.images` target `cluster` copies the runtime binaries, config, and `libnvidia-container` shared libraries from that staged local bundle into the final Ubuntu-based cluster image instead of installing toolkit packages from an apt repository during the build.
 - `deploy/docker/cluster-entrypoint.sh` checks `GPU_ENABLED=true` and copies GPU-only manifests from `/opt/openshell/gpu-manifests/` into k3s's manifests directory.
-- `deploy/kube/gpu-manifests/nvidia-device-plugin-helmchart.yaml` installs the NVIDIA device plugin chart, currently pinned to `0.18.2`, along with GPU Feature Discovery and Node Feature Discovery.
+- `deploy/kube/gpu-manifests/nvidia-device-plugin-helmchart.yaml` installs the NVIDIA device plugin chart, currently pinned to `0.18.2`. NFD and GFD are disabled; the device plugin's default `nodeAffinity` (which requires `feature.node.kubernetes.io/pci-10de.present=true` or `nvidia.com/gpu.present=true` from NFD/GFD) is overridden to empty so the DaemonSet schedules on the single-node cluster without requiring those labels.
 - k3s auto-detects `nvidia-container-runtime` on `PATH`, registers the `nvidia` containerd runtime, and creates the `nvidia` `RuntimeClass` automatically.
 - The OpenShell Helm chart grants the gateway service account cluster-scoped read access to `node.k8s.io/runtimeclasses` and core `nodes` so GPU sandbox admission can verify both the `nvidia` `RuntimeClass` and allocatable GPU capacity before creating a sandbox.
 
@@ -376,8 +378,8 @@ flowchart LR
   - Docker API failures from inspect/create/start/remove.
   - SSH connection failures when creating the remote Docker client.
   - Health check timeout (6 min) with recent container logs.
-   - Container exit during any polling phase (health, mTLS) with diagnostic information (exit code, OOM status, recent logs).
-   - mTLS secret polling timeout (3 min).
+   - Container exit during any polling phase with diagnostic information (exit code, OOM status, recent logs).
+   - PKI extraction or local mTLS storage failure after bootstrap reconciles the TLS materials.
   - Local image ref without registry prefix: clear error with build instructions rather than a failed Docker Hub pull.
 
 ## Auto-Bootstrap from `sandbox create`
@@ -417,7 +419,7 @@ Environment variables that affect bootstrap behavior when set on the host:
 |---|---|
 | `OPENSHELL_CLUSTER_IMAGE` | Overrides entire image ref if set and non-empty |
 | `IMAGE_TAG` | Sets image tag (default: `"dev"`) when `OPENSHELL_CLUSTER_IMAGE` is not set |
-| `NAV_GATEWAY_TLS_ENABLED` | Overrides HelmChart manifest for TLS enabled check (`true`/`1`/`yes`/`false`/`0`/`no`) |
+| `DISABLE_TLS` | Disables TLS-secret checks in the container healthcheck when set to `true` |
 | `XDG_CONFIG_HOME` | Base config directory (default: `$HOME/.config`) |
 | `DOCKER_HOST` | When `tcp://` and non-loopback, the host is added as a TLS SAN and used as the gateway endpoint |
 | `OPENSHELL_PUSH_IMAGES` | Comma-separated image refs to push into the gateway's containerd (local deploy only) |
@@ -460,7 +462,7 @@ openshell/
 - `crates/openshell-cli/src/main.rs` -- CLI command definitions
 - `crates/openshell-cli/src/run.rs` -- CLI command implementations
 - `crates/openshell-cli/src/bootstrap.rs` -- auto-bootstrap from sandbox create
-- `deploy/docker/Dockerfile.cluster` -- container image definition
+- `deploy/docker/Dockerfile.images` -- shared image build graph (`cluster` target for gateway bootstrap)
 - `deploy/docker/cluster-entrypoint.sh` -- container entrypoint script
 - `deploy/docker/cluster-healthcheck.sh` -- Docker HEALTHCHECK script
 - `deploy/kube/manifests/openshell-helmchart.yaml` -- OpenShell Helm chart manifest

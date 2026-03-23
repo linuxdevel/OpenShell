@@ -3,31 +3,49 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Build the k3s cluster image with bundled helm charts.
+# Unified Docker image builder for OpenShell image targets.
+# Usage: docker-build-image.sh <target> [extra docker build args...]
 #
-# Current GPU runtime path:
-#   1. require `OPENSHELL_RUNTIME_BUNDLE_TARBALL`
-#   2. validate the per-architecture bundle tarball before any Helm or Docker work
-#   3. stage its install-root payload under `deploy/docker/.build/runtime-bundle/<arch>/`
-#   4. let `deploy/docker/Dockerfile.cluster` copy the staged local runtime files
-#      into the cluster image
+# Supported targets:
+#   gateway             -> deploy/docker/Dockerfile.images target gateway
+#   cluster             -> deploy/docker/Dockerfile.images target cluster
+#   supervisor-builder  -> deploy/docker/Dockerfile.images target supervisor-builder
+#   supervisor-output   -> deploy/docker/Dockerfile.images target supervisor-output
 #
 # Environment:
-#   IMAGE_TAG                - Image tag (default: dev)
-#   K3S_VERSION              - k3s version override (optional; default in Dockerfile.cluster)
-#   OPENSHELL_RUNTIME_BUNDLE_TARBALL
-#                            - required path to the verified per-arch runtime bundle tarball
+#   IMAGE_TAG                         - Image tag (default: dev)
+#   DOCKER_PLATFORM                   - Target platform (optional, e.g. linux/amd64)
+#   DOCKER_BUILDER                    - Buildx builder name (default: auto-select)
+#   DOCKER_PUSH                       - When set to "1", push instead of loading into local daemon
+#   DOCKER_OUTPUT                     - Optional explicit buildx --output value; for export-style
+#                                     - targets like supervisor-output this bypasses forced tagging
+#                                     - and --load/--push so artifacts can be exported directly
+#   IMAGE_REGISTRY                    - Registry prefix for image name (e.g. ghcr.io/org/repo)
+#   IMAGE_NAME_OVERRIDE               - Full image repository/name override (e.g. ghcr.io/org/openshell-gateway)
+#   OPENSHELL_RUNTIME_BUNDLE_TARBALL  - required for cluster target
 #   OPENSHELL_RUNTIME_BUNDLE_VERIFY_ONLY
-#                            - when set to "1", validate and stage the bundle, then exit
-#   DOCKER_PLATFORM          - Target platform (optional)
-#   DOCKER_BUILDER           - Buildx builder name (default: auto-select)
-#   DOCKER_PUSH              - When set to "1", push instead of loading into local daemon
-#   IMAGE_REGISTRY           - Registry prefix for image name (e.g. ghcr.io/org/repo)
+#                                     - when set to "1" for cluster, validate and stage the bundle, then exit
+#   K3S_VERSION                       - k3s version override for cluster target (optional)
 set -euo pipefail
 
 fail() {
   printf '%s\n' "$*" >&2
   exit 1
+}
+
+usage() {
+  fail "Usage: docker-build-image.sh <target> [extra docker build args...]"
+}
+
+is_final_image_target() {
+  case "$1" in
+    gateway|cluster)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
 }
 
 sha256_16() {
@@ -410,35 +428,74 @@ stage_runtime_bundle() {
   printf '%s\n' "$stage_root/$bundle_name"
 }
 
-IMAGE_TAG=${IMAGE_TAG:-dev}
-IMAGE_NAME="openshell/cluster"
-if [[ -n "${IMAGE_REGISTRY:-}" ]]; then
-  IMAGE_NAME="${IMAGE_REGISTRY}/cluster"
+TARGET="${1:-}"
+if [[ -z "$TARGET" ]]; then
+  usage
 fi
+shift
+
+DOCKERFILE="deploy/docker/Dockerfile.images"
+if [[ ! -f "$DOCKERFILE" ]]; then
+  fail "Dockerfile not found: ${DOCKERFILE}"
+fi
+
+case "$TARGET" in
+  gateway)
+    IMAGE_NAME="openshell/gateway"
+    CACHE_SCOPE_TARGET="gateway"
+    ;;
+  cluster)
+    IMAGE_NAME="openshell/cluster"
+    CACHE_SCOPE_TARGET="cluster"
+    ;;
+  supervisor-builder|supervisor-output)
+    IMAGE_NAME="openshell/${TARGET}"
+    CACHE_SCOPE_TARGET="supervisor"
+    ;;
+  *)
+    fail "unsupported target: ${TARGET} (supported targets: gateway, cluster, supervisor-builder, supervisor-output)"
+    ;;
+esac
+
+if [[ -n "${IMAGE_NAME_OVERRIDE:-}" ]]; then
+  IMAGE_NAME="${IMAGE_NAME_OVERRIDE}"
+elif [[ -n "${IMAGE_REGISTRY:-}" ]]; then
+  IMAGE_NAME="${IMAGE_REGISTRY}/${IMAGE_NAME#openshell/}"
+fi
+
+if [[ "${OPENSHELL_RUNTIME_BUNDLE_VERIFY_ONLY:-}" == "1" && "$TARGET" != "cluster" ]]; then
+  fail "runtime bundle verify-only mode is only supported for target: cluster"
+fi
+
+IMAGE_TAG=${IMAGE_TAG:-dev}
 DOCKER_BUILD_CACHE_DIR=${DOCKER_BUILD_CACHE_DIR:-.cache/buildkit}
-CACHE_PATH="${DOCKER_BUILD_CACHE_DIR}/cluster"
+CACHE_PATH="${DOCKER_BUILD_CACHE_DIR}/${TARGET}"
 
 mkdir -p "${CACHE_PATH}"
 
-if [[ -z "${OPENSHELL_RUNTIME_BUNDLE_TARBALL:-}" ]]; then
-  fail "missing required variable: OPENSHELL_RUNTIME_BUNDLE_TARBALL"
+if [[ "$TARGET" == "cluster" ]]; then
+  if [[ -z "${OPENSHELL_RUNTIME_BUNDLE_TARBALL:-}" ]]; then
+    fail "missing required variable: OPENSHELL_RUNTIME_BUNDLE_TARBALL"
+  fi
+
+  if [[ ! -f "${OPENSHELL_RUNTIME_BUNDLE_TARBALL}" ]]; then
+    fail "runtime bundle validation failed: tarball not found: ${OPENSHELL_RUNTIME_BUNDLE_TARBALL}"
+  fi
+
+  TARGET_ARCH="$(target_arch)"
+  TARGET_MULTIARCH="$(target_multiarch "$TARGET_ARCH")"
+  STAGED_RUNTIME_BUNDLE="$(stage_runtime_bundle "${OPENSHELL_RUNTIME_BUNDLE_TARBALL}" "$TARGET_ARCH" "$TARGET_MULTIARCH")"
+
+  if [[ "${OPENSHELL_RUNTIME_BUNDLE_VERIFY_ONLY:-}" == "1" ]]; then
+    printf 'Runtime bundle staged at %s\n' "$STAGED_RUNTIME_BUNDLE"
+    exit 0
+  fi
+
+  mkdir -p deploy/docker/.build/charts
+  printf 'Packaging helm chart...\n'
+  helm package deploy/helm/openshell -d deploy/docker/.build/charts/
 fi
 
-if [[ ! -f "${OPENSHELL_RUNTIME_BUNDLE_TARBALL}" ]]; then
-  fail "runtime bundle validation failed: tarball not found: ${OPENSHELL_RUNTIME_BUNDLE_TARBALL}"
-fi
-
-TARGET_ARCH="$(target_arch)"
-TARGET_MULTIARCH="$(target_multiarch "$TARGET_ARCH")"
-STAGED_RUNTIME_BUNDLE="$(stage_runtime_bundle "${OPENSHELL_RUNTIME_BUNDLE_TARBALL}" "$TARGET_ARCH" "$TARGET_MULTIARCH")"
-
-if [[ "${OPENSHELL_RUNTIME_BUNDLE_VERIFY_ONLY:-}" == "1" ]]; then
-  printf 'Runtime bundle staged at %s\n' "$STAGED_RUNTIME_BUNDLE"
-  exit 0
-fi
-
-# Select builder — prefer native "docker" driver for local single-arch builds
-# to avoid slow tarball export from the docker-container driver.
 BUILDER_ARGS=()
 if [[ -n "${DOCKER_BUILDER:-}" ]]; then
   BUILDER_ARGS=(--builder "${DOCKER_BUILDER}")
@@ -449,7 +506,6 @@ fi
 
 CACHE_ARGS=()
 if [[ -z "${CI:-}" ]]; then
-  # Local development: use filesystem cache with docker-container driver.
   if docker buildx inspect ${BUILDER_ARGS[@]+"${BUILDER_ARGS[@]}"} 2>/dev/null | grep -q "Driver: docker-container"; then
     CACHE_ARGS=(
       --cache-from "type=local,src=${CACHE_PATH}"
@@ -458,38 +514,30 @@ if [[ -z "${CI:-}" ]]; then
   fi
 fi
 
-# Create build directory for charts
-mkdir -p deploy/docker/.build/charts
-
-# Runtime-bundle handoff:
-# - this script is the required acquisition/verification point before
-#   any Helm packaging or `docker buildx build`
-# - it validates manifest metadata plus manifest-authoritative payload checks,
-#   then stages the extracted install-root tree in `deploy/docker/.build/`
-# - `deploy/docker/Dockerfile.cluster` consumes only that staged local payload
-
-# Package helm chart
-echo "Packaging helm chart..."
-helm package deploy/helm/openshell -d deploy/docker/.build/charts/
-
-# Build cluster image (no bundled component images — they are pulled at runtime
-# from the distribution registry; credentials are injected at deploy time)
-echo "Building cluster image..."
-
 SCCACHE_ARGS=()
 if [[ -n "${SCCACHE_MEMCACHED_ENDPOINT:-}" ]]; then
   SCCACHE_ARGS=(--build-arg "SCCACHE_MEMCACHED_ENDPOINT=${SCCACHE_MEMCACHED_ENDPOINT}")
 fi
 
-OUTPUT_FLAG="--load"
-if [[ "${DOCKER_PUSH:-}" == "1" ]]; then
-  OUTPUT_FLAG="--push"
-elif [[ "${DOCKER_PLATFORM:-}" == *","* ]]; then
-  # Multi-platform builds cannot use --load; push is required.
-  OUTPUT_FLAG="--push"
+TAG_ARGS=(-t "${IMAGE_NAME}:${IMAGE_TAG}")
+OUTPUT_ARGS=()
+USED_EXPLICIT_OUTPUT=0
+if [[ -n "${DOCKER_OUTPUT:-}" ]]; then
+  USED_EXPLICIT_OUTPUT=1
+  OUTPUT_ARGS=(--output "${DOCKER_OUTPUT}")
+  if ! is_final_image_target "$TARGET"; then
+    TAG_ARGS=()
+  fi
+else
+  OUTPUT_FLAG="--load"
+  if [[ "${DOCKER_PUSH:-}" == "1" ]]; then
+    OUTPUT_FLAG="--push"
+  elif [[ "${DOCKER_PLATFORM:-}" == *","* ]]; then
+    OUTPUT_FLAG="--push"
+  fi
+  OUTPUT_ARGS=("${OUTPUT_FLAG}")
 fi
 
-# Compute cargo version from git tags (same scheme as docker-build-component.sh).
 VERSION_ARGS=()
 if [[ -n "${OPENSHELL_CARGO_VERSION:-}" ]]; then
   VERSION_ARGS=(--build-arg "OPENSHELL_CARGO_VERSION=${OPENSHELL_CARGO_VERSION}")
@@ -501,9 +549,11 @@ else
 fi
 
 LOCK_HASH=$(sha256_16 Cargo.lock)
-RUST_SCOPE=${RUST_TOOLCHAIN_SCOPE:-$(detect_rust_scope "deploy/docker/Dockerfile.cluster")}
-CACHE_SCOPE_INPUT="v1|cluster|base|${LOCK_HASH}|${RUST_SCOPE}"
+RUST_SCOPE=${RUST_TOOLCHAIN_SCOPE:-$(detect_rust_scope "${DOCKERFILE}")}
+CACHE_SCOPE_INPUT="v1|${CACHE_SCOPE_TARGET}|base|${LOCK_HASH}|${RUST_SCOPE}"
 CARGO_TARGET_CACHE_SCOPE=$(printf '%s' "${CACHE_SCOPE_INPUT}" | sha256_16_stdin)
+
+printf 'Building %s image target...\n' "$TARGET"
 
 docker buildx build \
   ${BUILDER_ARGS[@]+"${BUILDER_ARGS[@]}"} \
@@ -512,11 +562,17 @@ docker buildx build \
   ${SCCACHE_ARGS[@]+"${SCCACHE_ARGS[@]}"} \
   ${VERSION_ARGS[@]+"${VERSION_ARGS[@]}"} \
   --build-arg "CARGO_TARGET_CACHE_SCOPE=${CARGO_TARGET_CACHE_SCOPE}" \
-  -f deploy/docker/Dockerfile.cluster \
-  -t ${IMAGE_NAME}:${IMAGE_TAG} \
   ${K3S_VERSION:+--build-arg K3S_VERSION=${K3S_VERSION}} \
+  -f "${DOCKERFILE}" \
+  --target "${TARGET}" \
+  ${TAG_ARGS[@]+"${TAG_ARGS[@]}"} \
   --provenance=false \
-  ${OUTPUT_FLAG} \
+  "$@" \
+  ${OUTPUT_ARGS[@]+"${OUTPUT_ARGS[@]}"} \
   .
 
-echo "Done! Cluster image: ${IMAGE_NAME}:${IMAGE_TAG}"
+if [[ "${USED_EXPLICIT_OUTPUT}" == "1" ]] && ! is_final_image_target "$TARGET"; then
+  printf 'Done! Exported %s via --output %s\n' "$TARGET" "${DOCKER_OUTPUT}"
+else
+  printf 'Done! Built %s as %s\n' "$TARGET" "${IMAGE_NAME}:${IMAGE_TAG}"
+fi

@@ -6,7 +6,7 @@ OpenShell produces two container images, both published for `linux/amd64` and `l
 
 The gateway runs the control plane API server. It is deployed as a StatefulSet inside the cluster container via a bundled Helm chart.
 
-- **Dockerfile**: `deploy/docker/Dockerfile.gateway`
+- **Build target**: `deploy/docker/Dockerfile.images` target `gateway`
 - **Registry**: `ghcr.io/nvidia/openshell/gateway:latest`
 - **Pulled when**: Cluster startup (the Helm chart triggers the pull)
 - **Entrypoint**: `openshell-server --port 8080` (gRPC + HTTP, mTLS)
@@ -15,7 +15,7 @@ The gateway runs the control plane API server. It is deployed as a StatefulSet i
 
 The cluster image is a single-container Kubernetes distribution that bundles the Helm charts, Kubernetes manifests, and the `openshell-sandbox` supervisor binary needed to bootstrap the control plane.
 
-- **Dockerfile**: `deploy/docker/Dockerfile.cluster`
+- **Build target**: `deploy/docker/Dockerfile.images` target `cluster`
 - **Registry**: `ghcr.io/nvidia/openshell/cluster:latest`
 - **Pulled when**: `openshell gateway start`
 
@@ -25,7 +25,7 @@ The supervisor binary (`openshell-sandbox`) is cross-compiled in a build stage a
 
 OpenShell's runtime bundle publication contract is tarball-first. The canonical artifact is a per-architecture release tarball whose single top-level bundle directory contains the install-root payload plus `manifest.json`. If OCI publication is added later, it is only a mirror transport for that same bundle contract.
 
-The current cluster build now consumes that published tarball through the local staged bundle path. `tasks/scripts/docker-build-cluster.sh` requires `OPENSHELL_RUNTIME_BUNDLE_TARBALL`, fails before any Helm packaging or Docker build when the bundle is missing or invalid, and stages the verified install-root payload under `deploy/docker/.build/runtime-bundle/<arch>/`. `deploy/docker/Dockerfile.cluster` then copies the runtime binaries, config, and shared libraries from that staged local tree into the final cluster image.
+The current cluster build now consumes that published tarball through the local staged bundle path. `tasks/scripts/docker-build-image.sh cluster` requires `OPENSHELL_RUNTIME_BUNDLE_TARBALL`, fails before any Helm packaging or Docker build when the bundle is missing or invalid, and stages the verified install-root payload under `deploy/docker/.build/runtime-bundle/<arch>/`. `deploy/docker/Dockerfile.images` target `cluster` then copies the runtime binaries, config, and shared libraries from that staged local tree into the final cluster image.
 
 That requirement now flows through all cluster-image entrypoints instead of only the direct script call:
 
@@ -34,12 +34,12 @@ That requirement now flows through all cluster-image entrypoints instead of only
 - multi-arch publishing via `tasks/scripts/docker-publish-multiarch.sh` requires `OPENSHELL_RUNTIME_BUNDLE_TARBALL_AMD64` and `OPENSHELL_RUNTIME_BUNDLE_TARBALL_ARM64`, builds one verified per-arch cluster image at a time, then assembles the final multi-arch manifest from those architecture-specific tags
 - GitHub workflow cluster builds now consume release-asset URLs rather than local tarball paths directly: `tasks/scripts/download-runtime-bundle.sh` downloads per-arch tarballs into `deploy/docker/.build/runtime-bundles/`, `tasks/scripts/ci-build-cluster-image.sh` maps single-arch builds to `docker:build:cluster` and multi-arch builds to `docker:build:cluster:multiarch`, and `.github/workflows/docker-build.yml` passes explicit bundle URLs from workflow inputs or repo variables into that helper path
 
-The intended first OpenShell tarball consumption path is the `tasks/scripts/docker-build-cluster.sh` -> `deploy/docker/Dockerfile.cluster` flow:
+The intended first OpenShell tarball consumption path is the `tasks/scripts/docker-build-image.sh cluster` -> `deploy/docker/Dockerfile.images` target `cluster` flow:
 
-1. `tasks/scripts/docker-build-cluster.sh` receives the per-architecture runtime bundle tarball path through `OPENSHELL_RUNTIME_BUNDLE_TARBALL` before `docker buildx build`.
+1. `tasks/scripts/docker-build-image.sh cluster` receives the per-architecture runtime bundle tarball path through `OPENSHELL_RUNTIME_BUNDLE_TARBALL` before `docker buildx build`.
 2. The script verifies the single top-level bundle-directory shape, requires valid JSON `manifest.json` content inside that bundle directory with a matching `architecture`, validates manifest-declared checksums and sizes, and checks the required runtime payload paths before staging.
 3. The script stages the tarball payload into `deploy/docker/.build/runtime-bundle/<arch>/`, preserving the bundle directory and install-root layout expected by OpenShell.
-4. `deploy/docker/Dockerfile.cluster` loads the staged local bundle tree in a dedicated build stage and copies the verified runtime files into the same final image paths OpenShell already expects.
+4. `deploy/docker/Dockerfile.images` target `cluster` loads the staged local bundle tree in the `runtime-bundle` stage and copies the verified runtime files into the same final image paths OpenShell already expects.
 
 The tarball payload must contain the exact runtime assets the cluster image expects today:
 
@@ -74,7 +74,7 @@ The incremental deploy (`cluster-deploy-fast.sh`) fingerprints local Git changes
 | Changed files | Rebuild triggered |
 |---|---|
 | Cargo manifests, proto definitions, cross-build script | Gateway + supervisor |
-| `crates/openshell-server/*`, `Dockerfile.gateway` | Gateway |
+| `crates/openshell-server/*`, `deploy/docker/Dockerfile.images` | Gateway |
 | `crates/openshell-sandbox/*`, `crates/openshell-policy/*` | Supervisor |
 | `deploy/helm/openshell/*` | Helm upgrade |
 

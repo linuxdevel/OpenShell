@@ -13,13 +13,13 @@ Use **only** `openshell` CLI commands (`openshell status`, `openshell doctor log
 
 `openshell gateway start` creates a Docker container running k3s with the OpenShell server deployed via Helm. The deployment stages, in order, are:
 
-1. **Pre-deploy check**: `openshell gateway start` in interactive mode prompts to **reuse** (keep volume, clean stale nodes) or **recreate** (destroy everything, fresh start). `mise run cluster` always recreates before deploy.
+1. **Pre-deploy check**: `openshell gateway start` in interactive mode prompts to **reuse** (keep volume, clean stale nodes) or **recreate** (destroy everything, fresh start). `mise run cluster` bootstraps only when no healthy cluster is running; otherwise it performs incremental deploy.
 2. Ensure cluster image is available (local build or remote pull)
 3. Create Docker network (`openshell-cluster`) and volume (`openshell-cluster-{name}`)
 4. Create and start a privileged Docker container (`openshell-cluster-{name}`)
 5. Wait for k3s to generate kubeconfig (up to 60s)
 6. **Clean stale nodes**: Remove any `NotReady` k3s nodes left over from previous container instances that reused the same persistent volume
-7. **Prepare local images** (if `OPENSHELL_PUSH_IMAGES` is set): In `internal` registry mode, bootstrap waits for the in-cluster registry and pushes tagged images there. In `external` mode, bootstrap uses legacy `ctr -n k8s.io images import` push-mode behavior.
+7. **Prepare local images** (if `OPENSHELL_PUSH_IMAGES` is set): bootstrap imports the tagged images into the k3s containerd `k8s.io` namespace so the current cluster can consume locally built component images during incremental development flows.
 8. **Reconcile TLS PKI**: Load existing TLS secrets from the cluster; if missing, incomplete, or malformed, generate fresh PKI (CA + server + client certs). Apply secrets to cluster. If rotation happened and the OpenShell workload is already running, rollout restart and wait for completion (failed rollout aborts deploy).
 9. **Store CLI mTLS credentials**: Persist client cert/key/CA locally for CLI authentication.
 10. Wait for cluster health checks to pass (up to 6 min):
@@ -27,6 +27,8 @@ Use **only** `openshell` CLI commands (`openshell status`, `openshell doctor log
     - `openshell` statefulset ready in `openshell` namespace
     - TLS secrets `openshell-server-tls` and `openshell-client-tls` exist in `openshell` namespace
     - Sandbox supervisor binary exists at `/opt/openshell/bin/openshell-sandbox` (emits `HEALTHCHECK_MISSING_SUPERVISOR` marker if absent)
+
+The image build graph now lives in `deploy/docker/Dockerfile.images`. Use target `cluster` for the gateway bootstrap container and target `gateway` for the OpenShell server image.
 
 For local deploys, metadata endpoint selection now depends on Docker connectivity:
 
@@ -160,7 +162,7 @@ openshell doctor exec -- kubectl -n kube-system logs -l job-name=helm-install-op
 Common issues:
 
 - **Replicas 0/0**: The StatefulSet has been scaled to zero — no pods are running. This can happen after a failed deploy, manual scale-down, or Helm values misconfiguration. Fix: `openshell doctor exec -- kubectl -n openshell scale statefulset openshell --replicas=1`
-- **ImagePullBackOff**: The component image failed to pull. In `internal` mode, verify internal registry readiness and pushed image tags (Step 5). In `external` mode, check `/etc/rancher/k3s/registries.yaml` credentials/endpoints and DNS (Step 8). Default external registry is `ghcr.io/nvidia/openshell/` (public, no auth required). If using a private registry, ensure `--registry-username` and `--registry-token` (or `OPENSHELL_REGISTRY_USERNAME`/`OPENSHELL_REGISTRY_TOKEN`) were provided during deploy.
+- **ImagePullBackOff**: The component image failed to pull. Check `/etc/rancher/k3s/registries.yaml` credentials/endpoints and DNS (Step 8). The current bootstrap path configures external registry pulls by default. If using a private registry, ensure `--registry-username` and `--registry-token` (or `OPENSHELL_REGISTRY_USERNAME`/`OPENSHELL_REGISTRY_PASSWORD`) were provided during deploy.
 - **CrashLoopBackOff**: The server is crashing. Check pod logs for the actual error.
 - **Pending**: Insufficient resources or scheduling constraints.
 
@@ -177,9 +179,9 @@ Expected port: `30051/tcp` (mapped to configurable host port, default 8080; set 
 
 ### Step 5: Check Image Availability
 
-Component images (server, sandbox) can reach kubelet via two paths:
+Component images (server, sandbox) normally reach kubelet through the configured external registry path. For local development, the cluster task can also import locally built images directly into the k3s containerd `k8s.io` namespace.
 
-**Local/external pull mode** (default local via `mise run cluster`): Local images are tagged to the configured local registry base (default `127.0.0.1:5000/openshell/*`), pushed to that registry, and pulled by k3s via `registries.yaml` mirror endpoint (typically `host.docker.internal:5000`). The `cluster` task pushes prebuilt local tags (`openshell/*:dev`, falling back to `localhost:5000/openshell/*:dev` or `127.0.0.1:5000/openshell/*:dev`).
+**External pull path** (default bootstrap/runtime path): Images are pulled from the configured registry at runtime, and the entrypoint writes `/etc/rancher/k3s/registries.yaml` accordingly.
 
 ```bash
 # Verify image refs currently used by openshell deployment
@@ -189,14 +191,14 @@ openshell doctor exec -- kubectl -n openshell get statefulset openshell -o jsonp
 openshell doctor exec -- cat /etc/rancher/k3s/registries.yaml
 ```
 
-**Legacy push mode**: Images are imported into the k3s containerd `k8s.io` namespace.
+**Local imported-image path**: Images are imported into the k3s containerd `k8s.io` namespace for local development flows that set `OPENSHELL_PUSH_IMAGES`.
 
 ```bash
 # Check if images were imported into containerd (k3s default namespace is k8s.io)
 openshell doctor exec -- ctr -a /run/k3s/containerd/containerd.sock images ls | grep openshell
 ```
 
-**External pull mode** (remote deploy, or local with `OPENSHELL_REGISTRY_HOST`/`IMAGE_REPO_BASE` pointing at a non-local registry): Images are pulled from an external registry at runtime. The entrypoint generates `/etc/rancher/k3s/registries.yaml`.
+**Registry troubleshooting**: Remote deploy and normal pull-based flows depend on the generated `/etc/rancher/k3s/registries.yaml`.
 
 ```bash
 # Verify registries.yaml exists and has credentials
@@ -291,7 +293,7 @@ If DNS is broken, all image pulls from the distribution registry will fail, as w
 | StatefulSet `0/0` replicas | StatefulSet scaled to zero (failed deploy, manual scale-down, or Helm misconfiguration) | `openshell doctor exec -- kubectl -n openshell scale statefulset openshell --replicas=1` |
 | Local mTLS files missing | Deploy was interrupted before credentials were persisted | Extract from cluster secret `openshell-client-tls` (Step 6) |
 | Container not found | Image not built | `mise run docker:build:cluster` (local, with `OPENSHELL_RUNTIME_BUNDLE_TARBALL` set) or re-deploy (remote, with `--runtime-bundle-tarball`) |
-| Local cluster image build now fails before Docker starts with runtime-bundle validation errors | Missing, malformed, wrong-arch, or unstaged `OPENSHELL_RUNTIME_BUNDLE_TARBALL` input for the controlled GPU runtime path | Re-run the cluster-image build with `OPENSHELL_RUNTIME_BUNDLE_TARBALL` pointing at a valid per-arch bundle tarball, and confirm `tasks/scripts/docker-build-cluster.sh` stages `deploy/docker/.build/runtime-bundle/<arch>/` successfully |
+| Local cluster image build now fails before Docker starts with runtime-bundle validation errors | Missing, malformed, wrong-arch, or unstaged `OPENSHELL_RUNTIME_BUNDLE_TARBALL` input for the controlled GPU runtime path | Re-run the cluster-image build with `OPENSHELL_RUNTIME_BUNDLE_TARBALL` pointing at a valid per-arch bundle tarball, and confirm `tasks/scripts/docker-build-image.sh cluster` stages `deploy/docker/.build/runtime-bundle/<arch>/` successfully for `deploy/docker/Dockerfile.images` target `cluster` |
 | Remote deploy now fails before Docker starts with runtime-bundle validation errors | `scripts/remote-deploy.sh` was run without `--runtime-bundle-tarball`, or the synced tarball path on the remote host is missing/invalid | Re-run `scripts/remote-deploy.sh` with `--runtime-bundle-tarball <local-tarball>` and confirm the tarball syncs to `${REMOTE_DIR}/.cache/runtime-bundles/` before the remote cluster build starts |
 | Multi-arch cluster publish fails before Docker starts with missing runtime-bundle variables | One or both per-arch tarballs were not provided to `tasks/scripts/docker-publish-multiarch.sh` | Set `OPENSHELL_RUNTIME_BUNDLE_TARBALL_AMD64` and `OPENSHELL_RUNTIME_BUNDLE_TARBALL_ARM64` to valid per-arch tarballs, then re-run the multi-arch publish command |
 | Container exited, OOMKilled | Insufficient memory | Increase host memory or reduce workload |
@@ -306,6 +308,7 @@ If DNS is broken, all image pulls from the distribution registry will fail, as w
 | mTLS secrets missing | Bootstrap couldn't apply secrets (namespace not ready) | Check deploy logs and verify `openshell` namespace exists (Step 6) |
 | mTLS mismatch after redeploy | PKI rotated but workload not restarted, or rollout failed | Check that all three TLS secrets exist and that the openshell pod restarted after cert rotation (Step 6) |
 | Helm install job failed | Chart values error or dependency issue | `openshell doctor exec -- kubectl -n kube-system logs -l job-name=helm-install-openshell` |
+| NFD/GFD DaemonSets present (`node-feature-discovery`, `gpu-feature-discovery`) | Cluster was deployed before NFD/GFD were disabled (pre-simplify-device-plugin change) | These are harmless but add overhead. Clean up: `openshell doctor exec -- kubectl delete daemonset -n nvidia-device-plugin -l app.kubernetes.io/name=node-feature-discovery` and similarly for GFD. The `nvidia.com/gpu.present` node label is no longer applied; device plugin scheduling no longer requires it. |
 | Architecture mismatch (remote) | Built on arm64, deploying to amd64 | Cross-build the image for the target architecture |
 | Port conflict | Another service on the configured gateway host port (default 8080) | Stop conflicting service or use `--port` on `openshell gateway start` to pick a different host port |
 | gRPC connect refused to `127.0.0.1:443` in CI | Docker daemon is remote (`DOCKER_HOST=tcp://...`) but metadata still points to loopback | Verify metadata endpoint host matches `DOCKER_HOST` and includes non-loopback host |
@@ -314,7 +317,7 @@ If DNS is broken, all image pulls from the distribution registry will fail, as w
 | Pods evicted with "The node had condition: [DiskPressure]" | Host disk full, kubelet evicting pods | Free disk space on host, then `openshell gateway destroy <name> && openshell gateway start` |
 | `metrics-server` errors in logs | Normal k3s noise, not the root cause | These errors are benign — look for the actual failing health check component |
 | Stale NotReady nodes from previous deploys | Volume reused across container recreations | The deploy flow now auto-cleans stale nodes; if it still fails, manually delete NotReady nodes (see Step 2) or choose "Recreate" when prompted |
-| gRPC `UNIMPLEMENTED` for newer RPCs in push mode | Helm values still point at older pulled images instead of the pushed refs | Verify rendered `openshell-helmchart.yaml` uses the expected push refs (`server`, `sandbox`, `pki-job`) and not `:latest` |
+| gRPC `UNIMPLEMENTED` for newer RPCs after local image import | Helm values still point at an older gateway image instead of the imported ref | Verify rendered `openshell-helmchart.yaml` uses the expected gateway push ref and not `:latest` |
 | Sandbox pods crash with `/opt/openshell/bin/openshell-sandbox: no such file or directory` | Supervisor binary missing from cluster image | The cluster image was built/published without the `supervisor-builder` stage. Rebuild with `mise run docker:build:cluster` and recreate gateway. Bootstrap auto-detects via `HEALTHCHECK_MISSING_SUPERVISOR` marker |
 | `HEALTHCHECK_MISSING_SUPERVISOR` in health check logs | `/opt/openshell/bin/openshell-sandbox` not found in gateway container | Rebuild cluster image: `mise run docker:build:cluster`, then `openshell gateway destroy <name> && openshell gateway start` |
 

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! OpenShell Core - shared library for OpenShell components.
+//! `OpenShell` Core - shared library for `OpenShell` components.
 //!
 //! This crate provides:
 //! - Protocol buffer definitions and generated code
@@ -15,6 +15,7 @@ pub mod forward;
 pub mod inference;
 pub mod paths;
 pub mod proto;
+pub mod settings;
 
 pub use config::{Config, TlsConfig};
 pub use error::{Error, Result};
