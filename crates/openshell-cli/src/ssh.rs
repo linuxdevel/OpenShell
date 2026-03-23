@@ -451,6 +451,30 @@ pub(crate) async fn sandbox_exec_without_exec(
 ///
 /// This replaces the old rsync-based sync. Files are streamed as a tar archive
 /// to `ssh ... tar xf - -C <dest>` on the sandbox side.
+fn sandbox_extract_command(dest: &str, local_is_file: bool) -> String {
+    let dest = dest.trim_end_matches('/');
+
+    if local_is_file {
+        let parent = dest
+            .rfind('/')
+            .map_or(".", |pos| if pos == 0 { "/" } else { &dest[..pos] });
+        let name = dest.rfind('/').map_or(dest, |pos| &dest[pos + 1..]);
+
+        format!(
+            "mkdir -p {parent} && cat | tar xf - -C {parent} && if [ \"{name}\" != \"$(basename {name_escaped})\" ]; then exit 1; fi",
+            parent = shell_escape(parent),
+            name = name,
+            name_escaped = shell_escape(name),
+        )
+    } else {
+        format!(
+            "mkdir -p {} && cat | tar xf - -C {}",
+            shell_escape(dest),
+            shell_escape(dest)
+        )
+    }
+}
+
 pub async fn sandbox_sync_up_files(
     server: &str,
     name: &str,
@@ -464,17 +488,14 @@ pub async fn sandbox_sync_up_files(
     }
 
     let session = ssh_session_config(server, name, tls).await?;
+    let local_is_file = files.len() == 1 && base_dir.join(&files[0]).is_file();
 
     let mut ssh = ssh_base_command(&session.proxy_command);
     ssh.arg("-T")
         .arg("-o")
         .arg("RequestTTY=no")
         .arg("sandbox")
-        .arg(format!(
-            "mkdir -p {} && cat | tar xf - -C {}",
-            shell_escape(dest),
-            shell_escape(dest)
-        ))
+        .arg(sandbox_extract_command(dest, local_is_file))
         .stdin(Stdio::piped())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
@@ -539,11 +560,7 @@ pub async fn sandbox_sync_up(
         .arg("-o")
         .arg("RequestTTY=no")
         .arg("sandbox")
-        .arg(format!(
-            "mkdir -p {} && cat | tar xf - -C {}",
-            shell_escape(sandbox_path),
-            shell_escape(sandbox_path)
-        ))
+        .arg(sandbox_extract_command(sandbox_path, local_path.is_file()))
         .stdin(Stdio::piped())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
@@ -1049,6 +1066,34 @@ impl<T> ProxyStream for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 mod tests {
     use super::*;
     use crate::TEST_ENV_LOCK;
+
+    #[test]
+    fn sandbox_extract_command_uses_parent_dir_for_explicit_file_destination() {
+        let command = sandbox_extract_command("/sandbox/.local/share/opencode/auth.json", true);
+
+        assert!(
+            command.contains("mkdir -p /sandbox/.local/share/opencode"),
+            "expected parent directory creation, got: {command}"
+        );
+        assert!(
+            command.contains("tar xf - -C /sandbox/.local/share/opencode"),
+            "expected extraction in parent directory, got: {command}"
+        );
+        assert!(
+            !command.contains("mkdir -p /sandbox/.local/share/opencode/auth.json"),
+            "must not treat explicit file path as directory: {command}"
+        );
+    }
+
+    #[test]
+    fn sandbox_extract_command_keeps_directory_destinations_as_directories() {
+        let command = sandbox_extract_command("/sandbox/src", false);
+
+        assert_eq!(
+            command,
+            "mkdir -p /sandbox/src && cat | tar xf - -C /sandbox/src"
+        );
+    }
 
     #[test]
     fn upsert_host_block_appends_when_missing() {
